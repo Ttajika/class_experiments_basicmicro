@@ -10,66 +10,76 @@ import time
 
 # --- ページ設定 ---
 st.set_page_config(page_title="市場実験", layout="centered")
-DB_PATH = "market.db"
+# データベースファイルを永続ディスクに保存
+
+
+# --- ローカル or Render を判別してDBパスを切り替え ---
+if os.getenv("RENDER") == "true":
+    DB_PATH = "/data/market.db"  # Render上の永続ディスク
+else:
+    DB_PATH = "market.db"        # ローカルのカレントディレクトリ
+
+
 
 # --- DB接続 ---
 def connect():
     return sqlite3.connect(DB_PATH)
 
 def initialize_db():
-    conn = connect()
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS players (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT,
-        money INTEGER,
-        endowment INTEGER,
-        choice INTEGER,  -- 1: buy, -1: sell
-        submitted INTEGER DEFAULT 0,
-        payoff INTEGER,
-        info INTEGER,
-        class_name TEXT,
-        qty INTEGER,
-        unit INTEGER,
-        bid INTEGER,     -- （参考）平均MUなどに使える
-        mu1 INTEGER,
-        mu2 INTEGER,
-        mu3 INTEGER,
-        mu4 INTEGER,
-        mu5 INTEGER
-    )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS group_info (
-            id INTEGER PRIMARY KEY,
-            value INTEGER,
-            final_price INTEGER,
-            round INTEGER,
-            confirmed INTEGER DEFAULT 0,
-            show_result INTEGER DEFAULT 0,
-            show_graph INTEGER DEFAULT 0
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS player_history (
+    if not os.path.exists(DB_PATH):
+        conn = connect()
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS players (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT,
-            round INTEGER,
-            choice INTEGER,
-            bid INTEGER,
-            qty INTEGER,
-            unit INTEGER DEFAULT 0,
             money INTEGER,
             endowment INTEGER,
+            choice INTEGER,  -- 1: buy, -1: sell
+            submitted INTEGER DEFAULT 0,
             payoff INTEGER,
             info INTEGER,
-            class_name TEXT
+            class_name TEXT,
+            qty INTEGER,
+            unit INTEGER,
+            bid INTEGER,     -- （参考）平均MUなどに使える
+            mu1 INTEGER,
+            mu2 INTEGER,
+            mu3 INTEGER,
+            mu4 INTEGER,
+            mu5 INTEGER
         )
-    """)
-    c.execute("INSERT OR IGNORE INTO group_info (id, value, round) VALUES (1, 100, 1)")
-    conn.commit()
-    conn.close()
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS group_info (
+                id INTEGER PRIMARY KEY,
+                value INTEGER,
+                final_price INTEGER,
+                round INTEGER,
+                confirmed INTEGER DEFAULT 0,
+                show_result INTEGER DEFAULT 0,
+                show_graph INTEGER DEFAULT 0
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS player_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT,
+                round INTEGER,
+                choice INTEGER,
+                bid INTEGER,
+                qty INTEGER,
+                unit INTEGER DEFAULT 0,
+                money INTEGER,
+                endowment INTEGER,
+                payoff INTEGER,
+                info INTEGER,
+                class_name TEXT
+            )
+        """)
+        c.execute("INSERT OR IGNORE INTO group_info (id, value, round) VALUES (1, 100, 1)")
+        conn.commit()
+        conn.close()
 
 def load_player(student_id):
     conn = connect()

@@ -1,2 +1,6 @@
 streamlit
 pandas
+matplotlib
+time
+os
+random
