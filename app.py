@@ -234,7 +234,7 @@ def show_player_ui(class_name):
         if not player:
             player = initialize_player(student_id, class_name)
             st.success(f"新しくプレイヤー {student_id} を登録しました")
-            time.sleep(2)
+            time.sleep(1)
             st.rerun()
         else:
             st.info(f"ようこそ、{student_id} さん")
