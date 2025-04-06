@@ -21,19 +21,24 @@ def initialize_db():
     c = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS players (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT,
-            money INTEGER,
-            endowment INTEGER,
-            bid INTEGER,
-            qty INTEGER,
-            choice INTEGER,
-            payoff INTEGER,
-            submitted INTEGER DEFAULT 0,
-            info INTEGER,
-            unit INTEGER,
-            class_name TEXT
-        )
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
+        money INTEGER,
+        endowment INTEGER,
+        choice INTEGER,  -- 1: buy, -1: sell
+        submitted INTEGER DEFAULT 0,
+        payoff INTEGER,
+        info INTEGER,
+        class_name TEXT,
+        qty INTEGER,
+        unit INTEGER,
+        bid INTEGER,     -- （参考）平均MUなどに使える
+        mu1 INTEGER,
+        mu2 INTEGER,
+        mu3 INTEGER,
+        mu4 INTEGER,
+        mu5 INTEGER
+    )
     """)
     c.execute("""
         CREATE TABLE IF NOT EXISTS group_info (
@@ -54,7 +59,7 @@ def initialize_db():
             choice INTEGER,
             bid INTEGER,
             qty INTEGER,
-            unit INTEGER,
+            unit INTEGER DEFAULT 0,
             money INTEGER,
             endowment INTEGER,
             payoff INTEGER,
@@ -72,7 +77,7 @@ def load_player(student_id):
     result = c.execute("SELECT * FROM players WHERE name = ?", (student_id,)).fetchone()
     conn.close()
     if result:
-        keys = ["id", "name", "money", "endowment", "bid", "qty", "choice", "payoff", "submitted", "info", "unit"]
+        keys = ["id", "name", "money", "endowment", "choice", "submitted", "payoff", "info", "class_name", "qty","unit","bid", "mu1", "mu2", "mu3", "mu4", "mu5"]
         return dict(zip(keys, result))
     return None
 
@@ -151,41 +156,99 @@ def next_round():
     conn.commit()
     conn.close()
 
-def set_payoffs(players, value, class_name, round_num):
-    price = -1
-    demand, supply = 1000, 0
 
-    while supply < demand and price < 300:
-        price += 1
-        demand, supply = 0, 0
-        for p in players:
-            if p["choice"] == 1 and p["bid"] >= price:
-                demand += p["qty"]
-            elif p["choice"] == -1 and p["bid"] <= price:
-                supply += p["qty"]
 
+def set_payoffs(value, class_name):
     conn = connect()
     c = conn.cursor()
+
+    # --- 不参加者を締め切る ---
+    c.execute("""
+        UPDATE players
+        SET choice = 0, qty = 0, submitted = 1
+        WHERE submitted = 0 AND class_name = ?
+    """, (class_name,))
+    conn.commit()
+
+    # --- 提出済プレイヤー取得 ---
+    c.execute("SELECT * FROM players WHERE submitted = 1 AND class_name = ?", (class_name,))
+    rows = c.fetchall()
+    keys = [desc[0] for desc in c.description]
+    players = [dict(zip(keys, row)) for row in rows]
+
+    # --- 価格決定（最大取引量の価格を選ぶ） ---
+    def get_buy_qty(p, price):
+        return sum(1 for mu in [p["mu1"], p["mu2"], p["mu3"], p["mu4"], p["mu5"]] if mu is not None and mu >= price)
+
+    def get_sell_qty(p, price):
+        return sum(1 for mu in [p["mu1"], p["mu2"], p["mu3"], p["mu4"], p["mu5"]] if mu is not None and mu <= price)
+
+    best_price = None
+    max_trades = -1
+    for price in range(0, 301):
+        total_demand = sum(get_buy_qty(p, price) for p in players if p["choice"] == 1)
+        total_supply = sum(get_sell_qty(p, price) for p in players if p["choice"] == -1)
+        trade_volume = min(total_demand, total_supply)
+        if trade_volume > max_trades:
+            best_price = price
+            max_trades = trade_volume
+
+    price = best_price
+
+    # --- 単位ごとにマッチング（評価付き） ---
+    buy_units = []
+    sell_units = []
     for p in players:
+        if p["choice"] == 1:
+            for i, k in enumerate(["mu1", "mu2", "mu3", "mu4", "mu5"]):
+                mu = p.get(k)
+                if mu is not None and mu >= price:
+                    buy_units.append((mu, p["id"], i + 1))
+        elif p["choice"] == -1:
+            for i, k in enumerate(["mu1", "mu2", "mu3", "mu4", "mu5"]):
+                mu = p.get(k)
+                if mu is not None and mu <= price:
+                    sell_units.append((mu, p["id"], i + 1))
+
+    buy_units.sort(reverse=True)  # 高評価優先
+    sell_units.sort()             # 安評価優先
+
+    matched_buyers = {}
+    matched_sellers = {}
+
+    trades = min(len(buy_units), len(sell_units))
+    for i in range(trades):
+        _, buyer_id, _ = buy_units[i]
+        _, seller_id, _ = sell_units[i]
+        matched_buyers[buyer_id] = matched_buyers.get(buyer_id, 0) + 1
+        matched_sellers[seller_id] = matched_sellers.get(seller_id, 0) + 1
+
+    # --- 更新処理 ---
+    round_num = load_round()
+    for p in players:
+        uid = p["id"]
         unit = 0
-        if p["choice"] == 1 and p["bid"] >= price:
-            unit = p["qty"]
-        elif p["choice"] == -1 and p["bid"] <= price:
-            unit = -p["qty"]
-        money = p["money"] - price * unit
+        if p["choice"] == 1:
+            unit = matched_buyers.get(uid, 0)
+        elif p["choice"] == -1:
+            unit = -matched_sellers.get(uid, 0)
+
+        money = p["money"] - unit * price
         endowment = p["endowment"] + unit
         payoff = int(value * endowment + money)
 
-
-        c.execute("""UPDATE players SET payoff=?, money=?, endowment=?, unit=? WHERE id=?""",
-          (payoff, money, endowment, unit, p["id"]))
         c.execute("""
-            INSERT INTO player_history (name, round, choice, bid, qty, unit, money, endowment, payoff, info, class_name)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (p["name"], round_num, p["choice"], p["bid"], p["qty"], unit, money, endowment, payoff, p["info"], class_name))
+            UPDATE players
+            SET unit = ?, money = ?, endowment = ?, payoff = ?
+            WHERE id = ?
+        """, (unit, money, endowment, payoff, uid))
 
+        c.execute("""
+            INSERT INTO player_history (name, round, choice, qty, unit, money, endowment, payoff, info, class_name)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (p["name"], round_num, p["choice"], p["qty"], unit, money, endowment, payoff, p["info"], p["class_name"]))
 
-    c.execute("UPDATE group_info SET final_price=?, show_graph=1 WHERE id=1", (price,))
+    c.execute("UPDATE group_info SET final_price=?, show_result=1, show_graph=1 WHERE id=1", (price,))
     conn.commit()
     conn.close()
     return price
@@ -201,16 +264,22 @@ def load_all_players():
     conn = connect()
     c = conn.cursor()
     results = c.execute("SELECT * FROM players").fetchall()
-    keys = ["id", "name", "money", "endowment", "bid", "qty", "choice", "payoff", "submitted", "info", "unit"]
+    keys = ["id", "name", "money", "endowment", "choice", "submitted", "payoff", "info", "class_name", "qty","unit","bid", "mu1", "mu2", "mu3", "mu4", "mu5"]
     conn.close()
     return [dict(zip(keys, row)) for row in results]
 
 def compute_inverse_demand_supply(players):
     price_range = list(range(0, 201))
     demand, supply = [], []
-    for p in price_range:
-        d = sum(pl["qty"] for pl in players if pl["choice"] == 1 and pl["bid"] >= p)
-        s = sum(pl["qty"] for pl in players if pl["choice"] == -1 and pl["bid"] <= p)
+    def get_buy_qty(p, price):
+        return sum(1 for mu in [p["mu1"], p["mu2"], p["mu3"], p["mu4"], p["mu5"]] if mu is not None and mu >= price)
+
+    def get_sell_qty(p, price):
+        return sum(1 for mu in [p["mu1"], p["mu2"], p["mu3"], p["mu4"], p["mu5"]] if mu is not None and mu <= price)
+    for price in price_range:
+        d = sum(get_buy_qty(p, price) for p in players if p["choice"] == 1)
+        s = sum(get_sell_qty(p, price) for p in players if p["choice"] == -1)
+    
         demand.append(d)
         supply.append(s)
     return price_range, demand, supply
@@ -223,6 +292,8 @@ def show_player_ui(class_name):
         st.session_state.student_id = ""
 
     st.subheader("ログイン")
+    confirmed = load_confirmation()
+
 
     student_id = st.text_input("学籍番号を入力してください", value=st.session_state.student_id)
     if student_id:
@@ -232,6 +303,9 @@ def show_player_ui(class_name):
     if student_id:
         player = load_player(student_id)
         if not player:
+            if confirmed:
+                st.error("このセッションは終了しました")
+                st.stop()
             player = initialize_player(student_id, class_name)
             st.success(f"新しくプレイヤー {student_id} を登録しました")
             time.sleep(1)
@@ -250,17 +324,10 @@ def show_player_ui(class_name):
         except:
             group_value = 100
 
-        confirmed = load_confirmation()
         st.markdown(f"**ラウンド {round_num}｜所持金:** {player['money']} 円　｜　**商品:** {player['endowment']} 個")
         st.markdown(f"🧠 あなたに与えられた情報（info）: **{player['info']}**")
 
-        # 未提出でもchoiceがNoneのままにならないよう補正（次のラウンド開始時）
-        # ※フォームに入る前に表示されないよう、提出済み扱いはしない
-        if not confirmed and (player.get("choice") is None or player.get("bid") is None or player.get("qty") is None):
-            player["choice"] = 0
-            player["bid"] = 0
-            player["qty"] = 0
-            save_player(player)
+        
 
         # リロードボタン
         if st.button("🔄 市場結果を再読み込みする"):
@@ -308,28 +375,65 @@ def show_player_ui(class_name):
         c = conn.cursor()
         show_graph = c.execute("SELECT show_graph FROM group_info WHERE id=1").fetchone()
         if show_graph[0]==0:
-            st.subheader("取引の入力")
-            if not confirmed:
-                with st.form("trade_form"):
-                    choice = st.radio("取引選択", [1, -1], format_func=lambda x: "購入" if x == 1 else "売却")
-                    bid = st.slider("希望価格（円）", min_value=0, max_value=200, step=1)
-                    qty = st.slider("希望数量（個）", min_value=1, max_value=5, step=1)
-                    submitted = st.form_submit_button("提出")
+            
+            st.subheader("🛒 取引の種類と限界評価の入力")
+            # 1. 売買選択
+            trade_type = st.selectbox("取引の種類を選んでください", ["（選択してください）", "購入", "売却"])
 
-                    if submitted:
-                        if choice == 1 and bid * qty > player['money']:
-                            st.warning("所持金を超えています。")
-                        elif choice == -1 and qty > player['endowment']:
-                            st.warning("売却数量が多すぎます。")
-                        else:
-                            player.update({
-                                "choice": choice,
-                                "bid": bid,
-                                "qty": qty,
-                                "submitted": True
-                            })
-                            save_player(player)
-                            st.success("提出が完了しました。結果が出るまでお待ちください。")
+            # 2. 入力スライダー（条件付き）
+            mu_values = []
+            loss_values = []
+            qty = 0
+
+            if trade_type == "購入":
+                st.subheader("📥 購入：限界効用（単位ごとの評価）を入力してください")
+                max_qty = st.slider("最大で購入したい数量", 0, 5, 0)
+                qty = max_qty
+                for i in range(1, max_qty + 1):
+                    mu = st.slider(f"{i}個目を買うときの評価（限界効用）", 0, 300, key=f"buy_mu_{i}")
+                    mu_values.append(mu)
+
+            elif trade_type == "売却":
+                st.subheader("📤 売却：限界損失（手放すときの損）を入力してください")
+                if player['endowment'] == 0:
+                    st.warning("売却できる商品がありません。")
+                    return
+                max_qty = st.slider("最大で売却したい数量", 0, player['endowment'], 0)
+                qty = max_qty
+                for i in range(1, max_qty + 1):
+                    loss = st.slider(f"{i}個目を売るときの損失（限界効用の減少）", 0, 300, key=f"sell_loss_{i}")
+                    loss_values.append(loss)
+
+            # 3. 提出ボタン
+            if st.button("提出する"):
+                conn = connect()
+                c = conn.cursor()
+
+                mu_columns = ["mu1", "mu2", "mu3", "mu4", "mu5"]
+
+                if trade_type == "購入":
+                    choice = 1
+                    values = mu_values
+                elif trade_type == "売却":
+                    choice = -1
+                    values = loss_values
+                else:
+                    choice = 0
+                    qty = 0
+                    values = []
+
+                padded = values + [None] * (5 - len(values))
+
+                c.execute(f"""
+                    UPDATE players
+                    SET choice = ?, submitted = 1, qty = ?,
+                        {', '.join(f"{col} = ?" for col in mu_columns)}
+                    WHERE name = ? AND class_name = ?
+                """, (choice, qty, *padded, player["name"], class_name))
+
+                conn.commit()
+                conn.close()
+                st.success("提出が完了しました")
 
 
 # --- 管理者画面 ---
@@ -352,9 +456,7 @@ def show_admin_ui(class_name):
     st.dataframe(df)
     # 逆需要・供給関数グラフ描画
     players = load_all_players()
-    price_range = list(range(0, 201))
     prices, demand, supply = compute_inverse_demand_supply(players)
-
     fig, ax = plt.subplots()
     ax.plot(demand, prices, label="D")
     ax.plot(supply, prices, label="S")
@@ -365,9 +467,32 @@ def show_admin_ui(class_name):
     st.pyplot(fig)
 
     st.subheader("📈 市場精算処理")
-    if st.button("価格を集計して表示"):
-        price = set_payoffs(submitted_players, group_value, class_name, round_num)
-        st.success(f"市場価格は {price} 円に設定されました。")
+    if "stage" not in st.session_state:
+        st.session_state.stage = "A"
+
+    if st.session_state.stage == "A":
+        if st.button("価格を集計して表示"):
+            price = set_payoffs(group_value, class_name)
+            st.success(f"市場価格は {price} 円に設定されました。")
+            time.sleep(2)
+            st.session_state.stage = "B"
+
+            st.rerun()
+
+    elif st.session_state.stage == "B":
+         if st.button("次のラウンドへ"):
+            next_round()
+            st.success("ラウンドを進めました")
+            time.sleep(2)
+            st.session_state.stage = "A"
+            st.rerun()
+
+    
+    
+    
+ 
+
+       
 
    
     if not confirmed:
@@ -389,11 +514,8 @@ def show_admin_ui(class_name):
     st.download_button("履歴CSVをダウンロード", data=history_csv, file_name=f"history_{class_name}.csv", mime="text/csv")
 
 
-    # ラウンド制御
+    
     st.sidebar.header("実験制御")
-    if st.sidebar.button("次のラウンドへ"):
-        next_round()
-        st.sidebar.success("ラウンドを進めました")
 
     if st.sidebar.button("実験リセット"):
         reset_experiment()
