@@ -552,7 +552,7 @@ def main():
         st.title("⚙️ モード切替")
         admin_mode = st.checkbox("管理者モード")
 
-    if admin_mode:
+    if admin_mode or mode == "admin":
         password = st.sidebar.text_input("パスワード", type="password")
         if password == st.secrets["admin_pw"]:
             show_admin_ui(class_name)
