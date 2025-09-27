@@ -339,6 +339,10 @@ def show_player_ui(class_name):
     player = load_player(student_id)
     group_info = load_group_info()
 
+    if player and st.query_params.get("id") != student_id:
+        st.query_params["id"] = student_id   # 1.30+（これでURLが更新されて再実行されます）
+        st.rerun()
+
     if not player:
         if group_info.get('confirmed'):
             st.error("このセッションは既に終了しています。")
@@ -505,6 +509,10 @@ def main():
 
     query_params = st.query_params
     class_name = query_params.get("class")
+
+    url_student_id = query_params.get("id")
+    if url_student_id:
+        st.session_state["student_id"] = url_student_id
     
     if not class_name:
         st.error("URLにクラス情報が含まれていません。例: `?class=A` をURLの末尾に追加してください。")
