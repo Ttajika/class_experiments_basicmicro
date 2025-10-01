@@ -1,5 +1,5 @@
 # app.py
-# PostgreSQL対応 & 手動更新 Final Version
+# PostgreSQL対応 & 手動更新 Final Version（最小改修パフォーマンス改善版）
 
 # --- 0. Imports & Constants ---
 import streamlit as st
@@ -8,13 +8,16 @@ import os
 import random
 import matplotlib.pyplot as plt
 import time
-from functools import wraps
+import numpy as np
 
 try:
     import psycopg2
     from psycopg2.extras import DictCursor
+    from psycopg2.pool import SimpleConnectionPool
 except ImportError:
-    psycopg2 = None # Render環境以外ではpsycopg2がなくても動作するようにする
+    psycopg2 = None
+    DictCursor = None
+    SimpleConnectionPool = None
 
 import sqlite3
 
@@ -24,6 +27,7 @@ import sqlite3
 #    streamlit
 #    pandas
 #    matplotlib
+#    numpy
 #    psycopg2-binary  # PostgreSQLに接続するために必須
 #
 # 2. Renderの環境変数（Environment Variables）に以下を設定してください:
@@ -47,27 +51,53 @@ MAX_UNITS = 5
 PRICE_RANGE = range(0, MAX_PRICE + 1)
 
 
-# --- 1. データベース・ユーティリティ ---
+# --- 1. データベース・ユーティリティ（接続プール＆release導入） ---
+
+@st.cache_resource(show_spinner=False)
+def get_pg_pool():
+    """
+    Postgres接続プールを作成（存在すれば再利用）。
+    """
+    db_url = os.environ.get('DATABASE_URL')
+    if not (db_url and psycopg2 and SimpleConnectionPool):
+        return None
+    db_url = db_url.replace("postgres://", "postgresql://", 1)
+    # プランに応じてmaxconnは調整してください
+    return SimpleConnectionPool(minconn=1, maxconn=10, dsn=db_url)
 
 def connect():
     """
     RenderのPostgreSQLまたはローカルのSQLiteに接続する。
-    DATABASE_URL環境変数の有無で自動的に切り替える。
+    PostgreSQL時はプールから取得、SQLite時はWAL+busy_timeoutを設定。
     """
-    db_url = os.environ.get('DATABASE_URL')
-    if db_url and psycopg2:
-        # Render (PostgreSQL)
-        db_url = db_url.replace("postgres://", "postgresql://", 1)
-        return psycopg2.connect(db_url)
+    pool = get_pg_pool()
+    if pool:
+        return pool.getconn()
     else:
-        # Local (SQLite)
-        return sqlite3.connect("local_market.db")
+        conn = sqlite3.connect("local_market.db", check_same_thread=False)
+        # SQLite のロック耐性を上げる
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA busy_timeout=3000;")
+        except Exception:
+            pass
+        return conn
+
+def release(conn):
+    """
+    conn.close() の代わりに呼ぶ。Postgresはプールに返却、SQLiteはclose。
+    """
+    pool = get_pg_pool()
+    if pool and psycopg2 and isinstance(conn, psycopg2.extensions.connection):
+        pool.putconn(conn)
+    else:
+        conn.close()
 
 def get_cursor(conn):
     """DBの種類に応じて適切なカーソルを返す (列名でアクセス可能にする)"""
     if psycopg2 and isinstance(conn, psycopg2.extensions.connection):
         return conn.cursor(cursor_factory=DictCursor)
-    else: # sqlite3.Connection
+    else:  # sqlite3.Connection
         conn.row_factory = sqlite3.Row
         return conn.cursor()
 
@@ -75,12 +105,27 @@ def get_placeholder_char(conn):
     """DBの種類に応じたプレースホルダ文字 (%s or ?) を返す"""
     return "%s" if psycopg2 and isinstance(conn, psycopg2.extensions.connection) else "?"
 
+def row_to_dict(row):
+    """psycopg2のDictRow / sqlite3.Row を素のdictに正規化"""
+    if row is None:
+        return None
+    try:
+        return dict(row)
+    except Exception:
+        try:
+            return {k: row[k] for k in row.keys()}
+        except Exception:
+            return row
+
+def rows_to_dicts(rows):
+    return [row_to_dict(r) for r in rows]
+
+
 def retry_on_db_lock(func):
     """
     データベースがロックされている場合にリトライ処理を行うデコレータ。
     (SQLiteでのローカルテスト時にのみ意味を持つ)
     """
-    @wraps(func)
     def wrapper(*args, **kwargs):
         try:
             return func(*args, **kwargs)
@@ -94,14 +139,15 @@ def retry_on_db_lock(func):
                 raise e
     return wrapper
 
+
 @retry_on_db_lock
 def initialize_db():
-    """データベースとテーブルを初期化する"""
+    """データベースとテーブルを初期化する（インデックス含む）"""
     conn = connect()
     c = get_cursor(conn)
-    
+
     is_postgres = psycopg2 and isinstance(conn, psycopg2.extensions.connection)
-    
+
     # データ型と自動インクリメントをDBに合わせて切り替え
     id_type = "SERIAL PRIMARY KEY" if is_postgres else "INTEGER PRIMARY KEY AUTOINCREMENT"
     bool_type = "BOOLEAN" if is_postgres else "INTEGER"
@@ -130,7 +176,7 @@ def initialize_db():
             endowment INTEGER, payoff INTEGER, info INTEGER, class_name TEXT
         )
     """)
-    
+
     # group_infoに初期データがない場合のみINSERT
     c.execute("SELECT id FROM group_info WHERE id = 1")
     if c.fetchone() is None:
@@ -138,9 +184,14 @@ def initialize_db():
             "INSERT INTO group_info (id, value, round, confirmed, show_result, show_graph) VALUES (1, 100, 1, FALSE, FALSE, FALSE)"
         )
 
+    # インデックス（Postgres/SQLite共通でIF NOT EXISTS対応）
+    c.execute("CREATE INDEX IF NOT EXISTS idx_players_class ON players(class_name)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_players_class_sub ON players(class_name, submitted)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_player_name_class ON players(name, class_name)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_history_class_round ON player_history(class_name, round)")
+
     conn.commit()
-    c.close()
-    conn.close()
+    release(conn)
 
 
 # --- 2. データアクセス関数 (読み取り) ---
@@ -150,16 +201,16 @@ def load_player(student_id):
     c = get_cursor(conn)
     p = get_placeholder_char(conn)
     c.execute(f"SELECT * FROM players WHERE name = {p}", (student_id,))
-    result = c.fetchone()
-    conn.close()
+    result = row_to_dict(c.fetchone())
+    release(conn)
     return result
 
 def load_group_info():
     conn = connect()
     c = get_cursor(conn)
     c.execute("SELECT * FROM group_info WHERE id=1")
-    result = c.fetchone()
-    conn.close()
+    result = row_to_dict(c.fetchone())
+    release(conn)
     return result
 
 def load_all_players(class_name):
@@ -167,8 +218,8 @@ def load_all_players(class_name):
     c = get_cursor(conn)
     p = get_placeholder_char(conn)
     c.execute(f"SELECT * FROM players WHERE class_name = {p}", (class_name,))
-    results = c.fetchall()
-    conn.close()
+    results = rows_to_dicts(c.fetchall())
+    release(conn)
     return results
 
 
@@ -178,19 +229,20 @@ def load_all_players(class_name):
 def initialize_player(student_id, class_name):
     conn = connect()
     c = get_cursor(conn)
-    p = get_placeholder_char(conn)
     
-    c.execute(f"SELECT value FROM group_info WHERE id=1")
-    group_value = c.fetchone()['value'] or 100
+    c.execute("SELECT value FROM group_info WHERE id=1")
+    row = row_to_dict(c.fetchone())
+    group_value = (row.get('value') if row else 100) or 100
     prob_val = group_value / 100.0
     endowment = random.choices([1, 2, 3, 4], weights=[prob_val**3, prob_val**2, prob_val, 1])[0]
     money = INITIAL_MONEY - ENDOWMENT_MULTIPLIER * endowment
     info = int(random.expovariate(1 / prob_val)) if prob_val > 0 else 0
-    
+
+    p = get_placeholder_char(conn)
     sql = f"INSERT INTO players (name, money, endowment, submitted, info, class_name) VALUES ({p}, {p}, {p}, FALSE, {p}, {p})"
     c.execute(sql, (student_id, money, endowment, info, class_name))
     conn.commit()
-    conn.close()
+    release(conn)
 
 @retry_on_db_lock
 def submit_player_decision(player_name, class_name, choice, qty, mu_values):
@@ -205,7 +257,15 @@ def submit_player_decision(player_name, class_name, choice, qty, mu_values):
     params = [choice, qty] + padded_mus + [player_name, class_name]
     c.execute(query, params)
     conn.commit()
-    conn.close()
+    release(conn)
+
+def _get_unit_demands(player, price):
+    if player.get("choice") != 1: return 0
+    return sum(1 for i in range(1, MAX_UNITS + 1) if player.get(f"mu{i}") is not None and player.get(f"mu{i}") >= price)
+
+def _get_unit_supplies(player, price):
+    if player.get("choice") != -1: return 0
+    return sum(1 for i in range(1, MAX_UNITS + 1) if player.get(f"mu{i}") is not None and player.get(f"mu{i}") <= price)
 
 @retry_on_db_lock
 def set_payoffs(group_value, class_name):
@@ -213,23 +273,31 @@ def set_payoffs(group_value, class_name):
     c = get_cursor(conn)
     p = get_placeholder_char(conn)
     
+    # 未提出者を不参加（choice=0）として確定
     c.execute(f"UPDATE players SET choice = 0, qty = 0, submitted = TRUE WHERE submitted = FALSE AND class_name = {p}", (class_name,))
     conn.commit()
 
     players = load_all_players(class_name)
 
-    best_price, max_trades = -1, -1
-    for price in PRICE_RANGE:
-        total_demand = sum(_get_unit_demands(p_row, price) for p_row in players)
-        total_supply = sum(_get_unit_supplies(p_row, price) for p_row in players)
-        trade_volume = min(total_demand, total_supply)
-        if trade_volume > max_trades:
-            best_price, max_trades = price, trade_volume
-    
-    price = best_price if best_price != -1 else 0
+    # --- 高速化: 価格探索をヒストグラム×累積和で ---
+    prices_arr, demand_arr, supply_arr = compute_demand_supply_curves_fast(players)
+    trade_volume = np.minimum(demand_arr, supply_arr)
+    price = int(prices_arr[int(np.argmax(trade_volume))]) if len(trade_volume) > 0 else 0
 
-    buy_units = sorted([(p_row.get(f"mu{i+1}"), p_row["id"]) for p_row in players if p_row["choice"] == 1 for i in range(p_row.get("qty", 0)) if p_row.get(f"mu{i+1}") is not None and p_row.get(f"mu{i+1}") >= price], reverse=True)
-    sell_units = sorted([(p_row.get(f"mu{i+1}"), p_row["id"]) for p_row in players if p_row["choice"] == -1 for i in range(p_row.get("qty", 0)) if p_row.get(f"mu{i+1}") is not None and p_row.get(f"mu{i+1}") <= price])
+    # 成立ユニットをマッチング（priceで閾値）
+    buy_units = sorted(
+        [(player.get(f"mu{i+1}"), player["id"])
+         for player in players if player.get("choice") == 1
+         for i in range(player.get("qty", 0))
+         if player.get(f"mu{i+1}") is not None and player.get(f"mu{i+1}") >= price],
+        reverse=True
+    )
+    sell_units = sorted(
+        [(player.get(f"mu{i+1}"), player["id"])
+         for player in players if player.get("choice") == -1
+         for i in range(player.get("qty", 0))
+         if player.get(f"mu{i+1}") is not None and player.get(f"mu{i+1}") <= price]
+    )
     
     trades = min(len(buy_units), len(sell_units))
     matched_buyers, matched_sellers = {}, {}
@@ -240,23 +308,32 @@ def set_payoffs(group_value, class_name):
         matched_sellers[seller_id] = matched_sellers.get(seller_id, 0) + 1
 
     c.execute("SELECT round FROM group_info WHERE id=1")
-    round_num = c.fetchone()['round']
-    for p_row in players:
-        unit = 0
-        if p_row["choice"] == 1: unit = matched_buyers.get(p_row["id"], 0)
-        elif p_row["choice"] == -1: unit = -matched_sellers.get(p_row["id"], 0)
+    row = row_to_dict(c.fetchone())
+    round_num = row.get('round') if row else 1
 
-        money = p_row["money"] - unit * price
-        endowment = p_row["endowment"] + unit
+    for player in players:
+        unit = 0
+        if player.get("choice") == 1:
+            unit = matched_buyers.get(player["id"], 0)
+        elif player.get("choice") == -1:
+            unit = -matched_sellers.get(player["id"], 0)
+
+        money = player["money"] - unit * price
+        endowment = player["endowment"] + unit
         payoff = int(group_value * endowment + money)
 
-        c.execute(f"UPDATE players SET unit = {p}, money = {p}, endowment = {p}, payoff = {p} WHERE id = {p}", (unit, money, endowment, payoff, p_row["id"]))
-        c.execute(f"INSERT INTO player_history (name, round, choice, qty, unit, money, endowment, payoff, info, class_name) VALUES ({p}, {p}, {p}, {p}, {p}, {p}, {p}, {p}, {p}, {p})", 
-                  (p_row["name"], round_num, p_row["choice"], p_row.get("qty", 0), unit, money, endowment, payoff, p_row["info"], p_row["class_name"]))
+        c.execute(f"UPDATE players SET unit = {p}, money = {p}, endowment = {p}, payoff = {p} WHERE id = {p}",
+                  (unit, money, endowment, payoff, player["id"]))
+        c.execute(
+            f"INSERT INTO player_history (name, round, choice, qty, unit, money, endowment, payoff, info, class_name) "
+            f"VALUES ({p}, {p}, {p}, {p}, {p}, {p}, {p}, {p}, {p}, {p})",
+            (player["name"], round_num, player.get("choice"), player.get("qty", 0), unit,
+             money, endowment, payoff, player.get("info"), player.get("class_name"))
+        )
 
     c.execute(f"UPDATE group_info SET final_price={p}, show_result=TRUE, show_graph=TRUE WHERE id=1", (price,))
     conn.commit()
-    conn.close()
+    release(conn)
     return price
 
 @retry_on_db_lock
@@ -266,7 +343,7 @@ def next_round():
     c.execute("UPDATE group_info SET round = round + 1, final_price = NULL, confirmed = FALSE, show_result = FALSE, show_graph = FALSE")
     c.execute("UPDATE players SET submitted=FALSE, payoff=NULL, unit=NULL, choice=NULL, qty=NULL, mu1=NULL, mu2=NULL, mu3=NULL, mu4=NULL, mu5=NULL")
     conn.commit()
-    conn.close()
+    release(conn)
 
 @retry_on_db_lock
 def confirm_results():
@@ -274,54 +351,81 @@ def confirm_results():
     c = get_cursor(conn)
     c.execute("UPDATE group_info SET confirmed = TRUE WHERE id=1")
     conn.commit()
-    conn.close()
+    release(conn)
 
 @retry_on_db_lock
 def reset_experiment():
     new_value = random.randint(80, 200)
     conn = connect()
     c = get_cursor(conn)
-    p = get_placeholder_char(conn)
-    c.execute("TRUNCATE TABLE players, player_history RESTART IDENTITY" if psycopg2 and isinstance(conn, psycopg2.extensions.connection) else "DELETE FROM players")
-    if not (psycopg2 and isinstance(conn, psycopg2.extensions.connection)):
-        c.execute("DELETE FROM player_history") # SQLite does not support TRUNCATE on multiple tables
+    if psycopg2 and isinstance(conn, psycopg2.extensions.connection):
+        c.execute("TRUNCATE TABLE players, player_history RESTART IDENTITY")
+    else:
+        c.execute("DELETE FROM players")
+        c.execute("DELETE FROM player_history")  # SQLite does not support TRUNCATE on multiple tables
     
+    p = get_placeholder_char(conn)
     c.execute(f"UPDATE group_info SET final_price=NULL, round=1, value={p}, confirmed=FALSE, show_result=FALSE, show_graph=FALSE", (new_value,))
     conn.commit()
-    conn.close()
+    release(conn)
     if "student_id" in st.session_state:
         del st.session_state["student_id"]
 
 
-# --- 4. コアロジック & グラフ描画 ---
+# --- 4. 高速コアロジック & グラフ描画（キャッシュ付） ---
 
-def _get_unit_demands(player, price):
-    if player.get("choice") != 1: return 0
-    return sum(1 for i in range(1, MAX_UNITS + 1) if player.get(f"mu{i}") is not None and player.get(f"mu{i}") >= price)
+def compute_demand_supply_curves_fast(players):
+    """
+    各価格での需要・供給本数をヒストグラム＋累積和で計算（O(N×U + 価格数)）
+    """
+    buy_hist  = np.zeros(MAX_PRICE + 1, dtype=np.int32)
+    sell_hist = np.zeros(MAX_PRICE + 1, dtype=np.int32)
 
-def _get_unit_supplies(player, price):
-    if player.get("choice") != -1: return 0
-    return sum(1 for i in range(1, MAX_UNITS + 1) if player.get(f"mu{i}") is not None and player.get(f"mu{i}") <= price)
+    for p in players:
+        qty = int(p.get("qty") or 0)
+        ch  = p.get("choice")
+        if ch == 1:  # 購入
+            for i in range(1, qty + 1):
+                mu = p.get(f"mu{i}")
+                if mu is not None:
+                    buy_hist[int(mu)] += 1
+        elif ch == -1:  # 売却
+            for i in range(1, qty + 1):
+                mu = p.get(f"mu{i}")
+                if mu is not None:
+                    sell_hist[int(mu)] += 1
 
-def compute_demand_supply_curves(players):
-    demand, supply = [], []
-    for price in PRICE_RANGE:
-        demand.append(sum(_get_unit_demands(p, price) for p in players))
-        supply.append(sum(_get_unit_supplies(p, price) for p in players))
-    return list(PRICE_RANGE), demand, supply
+    # 需要: mu >= price → 右からの累積和
+    demand = buy_hist[::-1].cumsum()[::-1]
+    # 供給: mu <= price → 左からの累積和
+    supply = sell_hist.cumsum()
 
-def plot_market_curves(players, final_price=None):
-    prices, demand, supply = compute_demand_supply_curves(players)
+    prices = np.arange(MAX_PRICE + 1)
+    return prices, demand, supply
+
+def plot_market_curves_from_arrays(prices, demand, supply, final_price=None):
     fig, ax = plt.subplots()
     ax.plot(demand, prices, label="Demand", drawstyle="steps-post")
     ax.plot(supply, prices, label="Supply", drawstyle="steps-post")
     if final_price is not None:
-        ax.axhline(y=final_price, color='r', linestyle='--', label=f'Price = {final_price}')
+        ax.axhline(y=final_price, linestyle='--', label=f'Price = {final_price}')
     ax.set_xlabel("Quantity")
     ax.set_ylabel("Price")
     ax.set_title("Market Demand and Supply")
     ax.legend()
     ax.grid(True)
+    return fig
+
+@st.cache_data(show_spinner=False, ttl=5)
+def cached_curves(class_name):
+    players = load_all_players(class_name)
+    prices, demand, supply = compute_demand_supply_curves_fast(players)
+    # numpy配列はそのまま返せないのでlist化
+    return prices.tolist(), demand.tolist(), supply.tolist()
+
+def render_market_graph(class_name, final_price=None):
+    prices, demand, supply = cached_curves(class_name)
+    fig = plot_market_curves_from_arrays(np.array(prices), np.array(demand), np.array(supply), final_price)
     st.pyplot(fig)
 
 
@@ -379,8 +483,7 @@ def show_player_ui(class_name):
         else: st.info("あなたの注文は成立しませんでした。")
 
         if group_info.get('show_graph'):
-            all_players = load_all_players(class_name)
-            plot_market_curves(all_players, final_price)
+            render_market_graph(class_name, final_price)
 
         if group_info.get('confirmed'):
             st.subheader("🎉 最終結果")
@@ -396,40 +499,61 @@ def show_player_ui(class_name):
     # 3. 未提出の状態
     else:
         st.header("🛒 取引入力")
-        trade_type = st.radio("取引の種類を選択:", ["購入", "売却"], horizontal=True)
 
-        mu_values = []
+        # --- Step 1: 取引種別と数量（ここは再実行されますが1回だけ想定） ---
+        trade_type = st.radio("取引の種類を選択:", ["購入", "売却"], horizontal=True, key="trade_type")
+
         if trade_type == "購入":
+            qty_limit = MAX_UNITS
             st.subheader("📥 購入希望の入力")
-            max_qty = st.slider("最大で購入したい数量", 0, MAX_UNITS, 0)
-            if max_qty > 0:
-                st.write("1個ずつ、いくらまでなら支払ってもよいか（限界効用）を入力してください。")
-                for i in range(1, max_qty + 1):
-                    mu_values.append(st.slider(f"{i}個目の評価額", 0, MAX_PRICE, 100, key=f"buy_mu_{i}"))
-        else: # 売却
-            st.subheader("📤 売却希望の入力")
+        else:
             if player['endowment'] == 0:
                 st.warning("売却できる商品がありません。")
                 return
-            max_qty = st.slider("最大で売却したい数量", 0, player['endowment'], 0)
-            if max_qty > 0:
-                st.write("1個ずつ、最低いくらで売りたいか（限界費用/損失）を入力してください。")
-                for i in range(1, max_qty + 1):
-                    mu_values.append(st.slider(f"{i}個目の評価額", 0, MAX_PRICE, 100, key=f"sell_loss_{i}"))
+            qty_limit = player['endowment']
+            st.subheader("📤 売却希望の入力")
 
-        if st.button("決定を提出する", type="primary"):
-            choice = 1 if trade_type == "購入" else -1
-            submit_player_decision(student_id, class_name, choice, len(mu_values), mu_values)
-            st.success("提出しました！")
-            time.sleep(1)
-            st.rerun()
+        max_qty = st.slider(
+            "数量を決めてください（次のステップで各個の評価額を入力）",
+            0, qty_limit, min(qty_limit, st.session_state.get("max_qty", 0)),
+            key="max_qty"
+        )
+
+        # --- Step 2: フォームで“まとめて”入力（ここではスライダーを動かしても再実行されません） ---
+        if max_qty > 0:
+            with st.form("order_form", clear_on_submit=False):
+                st.caption("各個の評価額（購入なら『支払ってよい上限』、売却なら『最低売りたい価格』）")
+                mu_values = []
+                # trade_typeごとに別キーにして衝突回避
+                mu_key_prefix = "buy_mu_" if trade_type == "購入" else "sell_loss_"
+                default_val = 100
+
+                for i in range(1, max_qty + 1):
+                    key = f"{mu_key_prefix}{i}"
+                    val = st.slider(
+                        f"{i}個目の評価額", 0, MAX_PRICE,
+                        value=st.session_state.get(key, default_val),
+                        key=key
+                    )
+                    mu_values.append(val)
+
+                submitted = st.form_submit_button("決定を提出する", type="primary")
+
+            # --- Step 3: 送信時だけDBを書き、再実行（=画面更新） ---
+            if submitted:
+                choice = 1 if trade_type == "購入" else -1
+                submit_player_decision(student_id, class_name, choice, len(mu_values), mu_values)
+                st.success("提出しました！")
+                time.sleep(0.5)
+                st.rerun()
+
 
 def show_admin_ui(class_name):
     st.header(f"🔐 管理者モード (クラス: {class_name})")
     
     group_info = load_group_info()
     players = load_all_players(class_name)
-    submitted_players = [p for p in players if p["submitted"]]
+    submitted_players = [p for p in players if p.get("submitted")]
 
     st.subheader("現在の状況")
     col1, col2, col3, col4 = st.columns(4)
@@ -468,12 +592,11 @@ def show_admin_ui(class_name):
 
     st.subheader("📊 リアルタイムデータ")
     if players:
-        plot_market_curves(players, final_price)
+        render_market_graph(class_name, final_price)
         df_players = pd.DataFrame(players)
         # DataFrameの列を整形
         display_cols = ['name', 'choice', 'qty', 'unit', 'money', 'endowment', 'payoff', 'info', 'submitted']
         st.dataframe(df_players[[col for col in display_cols if col in df_players.columns]], use_container_width=True)
-
     else:
         st.info("まだ参加者がいません。")
 
@@ -487,25 +610,38 @@ def show_admin_ui(class_name):
         st.rerun()
     
     st.sidebar.header("📦 履歴ダウンロード")
-    conn = connect()
-    p = get_placeholder_char(conn)
-    history_df = pd.read_sql_query(f"SELECT * FROM player_history WHERE class_name = {p}", conn, params=(class_name,))
-    conn.close()
     st.sidebar.download_button(
         "履歴CSVをダウンロード",
-        data=history_df.to_csv(index=False).encode("utf-8"),
+        data=history_csv_blob(class_name),
         file_name=f"history_{class_name}_{time.strftime('%Y%m%d')}.csv",
         mime="text/csv"
     )
 
-# --- 6. メイン処理 ---
+
+# --- 6. 補助: 履歴CSVのキャッシュ ---
+
+@st.cache_data(show_spinner=False, ttl=30)
+def history_csv_blob(class_name):
+    conn = connect()
+    p = get_placeholder_char(conn)
+    df = pd.read_sql_query(f"SELECT * FROM player_history WHERE class_name = {p}", conn, params=(class_name,))
+    release(conn)
+    return df.to_csv(index=False).encode("utf-8")
+
+
+# --- 7. メイン処理（DB初期化は一度だけ） ---
+
+@st.cache_resource(show_spinner=False)
+def ensure_db():
+    initialize_db()
+    return True
 
 def main():
     st.set_page_config(page_title="市場実験", layout="centered")
     st.title("ようこそ、市場実験へ！")
 
-    # DBが存在しない場合、この時点で初期化
-    initialize_db()
+    # DBが存在しない場合、この時点で初期化（1回のみ）
+    ensure_db()
 
     query_params = st.query_params
     class_name = query_params.get("class")

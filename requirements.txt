@@ -2,4 +2,4 @@ streamlit
 pandas
 matplotlib
 psycopg2-binary
-
+numpy
