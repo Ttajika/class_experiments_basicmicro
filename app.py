@@ -235,7 +235,7 @@ def initialize_player(student_id, class_name):
     prob_val = group_value / 100.0
     endowment = random.choices([1, 2, 3, 4], weights=[prob_val**3, prob_val**2, prob_val, 1])[0]
     money = INITIAL_MONEY - ENDOWMENT_MULTIPLIER * endowment
-    info = int(random.expovariate(1 / prob_val)) if prob_val > 0 else 0
+    info = int(random.expovariate(1 / group_value)) if prob_val > 0 else 0
 
     p = get_placeholder_char(conn)
     sql = f"INSERT INTO players (name, money, endowment, submitted, info, class_name) VALUES ({p}, {p}, {p}, FALSE, {p}, {p})"
