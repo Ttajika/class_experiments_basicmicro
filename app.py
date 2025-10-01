@@ -203,7 +203,7 @@ def load_player(student_id):
     release(conn)
     return result
 
-@st.cache_data(ttl=1, show_spinner=False)
+@st.cache_data(ttl=5, show_spinner=False)
 def load_group_info():
     conn = connect()
     c = get_cursor(conn)
