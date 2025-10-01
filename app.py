@@ -6,9 +6,7 @@ import streamlit as st
 import pandas as pd
 import os
 import random
-import matplotlib.pyplot as plt
 import time
-import numpy as np
 
 try:
     import psycopg2
@@ -205,6 +203,7 @@ def load_player(student_id):
     release(conn)
     return result
 
+@st.cache_data(ttl=1, show_spinner=False)
 def load_group_info():
     conn = connect()
     c = get_cursor(conn)
@@ -269,6 +268,7 @@ def _get_unit_supplies(player, price):
 
 @retry_on_db_lock
 def set_payoffs(group_value, class_name):
+    import numpy as np
     conn = connect()
     c = get_cursor(conn)
     p = get_placeholder_char(conn)
@@ -378,6 +378,7 @@ def compute_demand_supply_curves_fast(players):
     """
     各価格での需要・供給本数をヒストグラム＋累積和で計算（O(N×U + 価格数)）
     """
+    import numpy as np
     buy_hist  = np.zeros(MAX_PRICE + 1, dtype=np.int32)
     sell_hist = np.zeros(MAX_PRICE + 1, dtype=np.int32)
 
@@ -404,6 +405,7 @@ def compute_demand_supply_curves_fast(players):
     return prices, demand, supply
 
 def plot_market_curves_from_arrays(prices, demand, supply, final_price=None):
+    import matplotlib.pyplot as plt
     fig, ax = plt.subplots()
     ax.plot(demand, prices, label="Demand", drawstyle="steps-post")
     ax.plot(supply, prices, label="Supply", drawstyle="steps-post")
@@ -424,6 +426,8 @@ def cached_curves(class_name):
     return prices.tolist(), demand.tolist(), supply.tolist()
 
 def render_market_graph(class_name, final_price=None):
+    import numpy as np
+
     prices, demand, supply = cached_curves(class_name)
     fig = plot_market_curves_from_arrays(np.array(prices), np.array(demand), np.array(supply), final_price)
     st.pyplot(fig)
@@ -440,6 +444,7 @@ def show_player_ui(class_name):
         return
 
     st.session_state.student_id = student_id
+    ensure_db()
     player = load_player(student_id)
     group_info = load_group_info()
 
@@ -550,7 +555,8 @@ def show_player_ui(class_name):
 
 def show_admin_ui(class_name):
     st.header(f"🔐 管理者モード (クラス: {class_name})")
-    
+    ensure_db()
+
     group_info = load_group_info()
     players = load_all_players(class_name)
     submitted_players = [p for p in players if p.get("submitted")]
@@ -641,7 +647,6 @@ def main():
     st.title("ようこそ、市場実験へ！")
 
     # DBが存在しない場合、この時点で初期化（1回のみ）
-    ensure_db()
 
     query_params = st.query_params
     class_name = query_params.get("class")
